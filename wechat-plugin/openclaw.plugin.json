@@ -1,0 +1,19 @@
+{
+  "id": "x-validator-wechat",
+  "name": "X Validator",
+  "description": "Verifies X screenshots in the paired WeChat conversation.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["python", "worker", "mediaRoot"],
+    "properties": {
+      "python": { "type": "string", "minLength": 1 },
+      "worker": { "type": "string", "minLength": 1 },
+      "mediaRoot": { "type": "string", "minLength": 1 },
+      "smokeTest": { "type": "boolean" }
+    }
+  }
+}
