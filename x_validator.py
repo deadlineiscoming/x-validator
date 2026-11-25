@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from datetime import timedelta
+from threading import Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -73,6 +74,8 @@ class XClient:
         self.bearer_token = bearer_token.strip()
         if not self.bearer_token or not re.fullmatch(r"[!-~]+", self.bearer_token):
             raise ValueError("请输入完整的 App-only Bearer Token，不含 Bearer 前缀。")
+        self.request_count = 0
+        self._request_lock = Lock()
 
     def get_post(self, link_or_id):
         post_id = parse_post_id(link_or_id)
@@ -160,6 +163,8 @@ class XClient:
         query = urlencode(params)
         request = Request(f"{API_URL}{path}?{query}", headers={"Accept": "application/json"})
         request.add_unredirected_header("Authorization", f"Bearer {self.bearer_token}")
+        with self._request_lock:
+            self.request_count += 1
         with urlopen(request, timeout=timeout) as response:
             payload = json.load(response)
 

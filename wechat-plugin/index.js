@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, realpath, rm, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
 
@@ -12,6 +13,20 @@ const FAILURE = "这次核验没有完成。请重新发截图或原帖链接再
 
 function send(text) {
   return { handled: true, text };
+}
+
+async function recordLocal(directory, name, value, logger) {
+  if (!directory) return;
+  const entry = join(directory, name);
+  const temporary = `${entry}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, JSON.stringify(value), { flag: "wx" });
+    await rename(temporary, entry);
+  } catch {
+    logger.warn("X Validator could not save local status");
+  } finally {
+    await unlink(temporary).catch(() => {});
+  }
 }
 
 function isInside(root, file) {
@@ -107,6 +122,18 @@ export function makeHandler(settings, logger, run = startWorker) {
   const results = new Map();
   const seen = new Map();
   const active = new Map();
+  let statusWrite = Promise.resolve();
+
+  function recordCheck(started, result) {
+    if (!settings.monitorDir) return;
+    const counts = result?.request_counts;
+    const summary = {
+      finished_at: new Date().toISOString(), duration_ms: Math.round(performance.now() - started),
+      ok: Boolean(result), counts: counts ? { x: counts.x, model: counts.model, web: counts.web } : null,
+    };
+    statusWrite = statusWrite.then(() => recordLocal(settings.monitorDir, "last-check.json", summary, logger));
+    return statusWrite;
+  }
 
   return async function handle(event, context) {
     const channel = context.channelId ?? event.channelId;
@@ -170,14 +197,17 @@ export function makeHandler(settings, logger, run = startWorker) {
         }
         return send(HELP);
       }
+      const started = performance.now();
       try {
         const { result, mediaUrls, dispose } = await run(settings, {
           image_path: imagePath, text, previous: imagePath ? null : previous,
         });
         remember(results, session, result, 32);
+        await recordCheck(started, result);
         logger.info("X Validator completed a WeChat verification");
         return { ...send(result.reply), mediaUrls, dispose };
       } catch {
+        await recordCheck(started, null);
         logger.warn("X Validator worker did not complete");
         return send(FAILURE);
       }
@@ -197,7 +227,16 @@ export function makeHandler(settings, logger, run = startWorker) {
 export default {
   id: "x-validator-wechat",
   register(api) {
-    const handle = makeHandler(api.pluginConfig, api.logger);
+    const monitorDir = process.env.X_VALIDATOR_MONITOR_DIR;
+    if (monitorDir && process.env.X_VALIDATOR_ACTIVE_ROUTES) {
+      try {
+        const routes = JSON.parse(process.env.X_VALIDATOR_ACTIVE_ROUTES);
+        void recordLocal(monitorDir, "active-routes.json", { pid: process.pid, routes }, api.logger);
+      } catch {
+        api.logger.warn("X Validator could not read active routes");
+      }
+    }
+    const handle = makeHandler({ ...api.pluginConfig, monitorDir }, api.logger);
     api.on("reply_dispatch", async (event, context) => {
       const message = event.ctx;
       const paths = message.MediaPaths ?? (message.MediaPath ? [message.MediaPath] : []);

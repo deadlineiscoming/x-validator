@@ -1,10 +1,15 @@
+import json
 import unittest
+from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta, timezone
+from io import StringIO
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
-from verify_screenshot import assess_account, find_original, normalize_extraction, post_time_window, render_fact_summary, verify
+from deepseek_client import DeepSeekError, clients_from_env
+from diagnostics import DEMO_IMAGE, check_online
+from verify_screenshot import assess_account, fetch_sources, find_original, normalize_extraction, post_time_window, render_fact_summary, verify
 from x_validator import AUTHOR_FIELDS, XClient
 
 
@@ -72,8 +77,121 @@ class LocalDeepSeek:
 
 
 class VerifyScreenshotTests(unittest.TestCase):
+    def test_model_routes_support_one_key_two_keys_and_custom_endpoints(self):
+        defaults = clients_from_env({"DEEPSEEK_API_KEY": "shared-key"})
+        self.assertEqual(defaults["reader"].model, "deepseek-flash")
+        self.assertEqual(defaults["reviewer"].model, "deepseek-v4-pro")
+        self.assertEqual(defaults["vision_reviewer"].model, "deepseek-flash")
+        self.assertEqual(defaults["vision_reviewer"].image_detail, "original")
+        self.assertEqual({client.key for client in defaults.values()}, {"shared-key"})
+
+        env = {"DEEPSEEK_API_KEY": "web-key", "X_VALIDATOR_FAST_API_KEY": "fast-key", "X_VALIDATOR_REVIEW_API_KEY": "review-key"}
+        distinct = clients_from_env(env)
+        self.assertEqual(distinct["reader"].key, "fast-key")
+        self.assertEqual(distinct["reviewer"].key, "review-key")
+        self.assertEqual(distinct["deepseek"].key, "web-key")
+
+        custom = clients_from_env(env | {
+            "X_VALIDATOR_REVIEW_BASE_URL": "http://127.0.0.1:5111/v1", "X_VALIDATOR_REVIEW_MODEL": "text-model",
+            "X_VALIDATOR_REVIEW_VISION_MODEL": "image-model",
+        })
+        self.assertEqual(custom["reviewer"].base_url, "http://127.0.0.1:5111/v1")
+        self.assertEqual(custom["vision_reviewer"].model, "image-model")
+        with self.assertRaises(ValueError):
+            clients_from_env({"DEEPSEEK_API_KEY": "shared-key", "X_VALIDATOR_REVIEW_BASE_URL": "https://example.org/v1"})
+
+    def test_model_presets_send_provider_specific_json_requests(self):
+        cases = (
+            ("openai", "https://api.openai.com/v1", "max_completion_tokens"),
+            ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "max_tokens"),
+            ("qwen", "https://example.cn/compatible-mode/v1", "max_tokens"),
+            ("doubao", "https://ark.cn-beijing.volces.com/api/v3", "max_completion_tokens"),
+            ("kimi", "https://api.moonshot.ai/v1", "max_completion_tokens"),
+            ("claude", "https://api.anthropic.com/v1", "max_tokens"),
+        )
+        for provider, base_url, token_field in cases:
+            with self.subTest(provider=provider), patch("deepseek_client.urlopen") as http:
+                http.return_value.__enter__.return_value.read.return_value = json.dumps({
+                    "choices": [{"finish_reason": "stop", "message": {"content": '{"verdict":"insufficient"}'}}],
+                }).encode()
+                env = {"X_VALIDATOR_FAST_PROVIDER": provider, "X_VALIDATOR_FAST_MODEL": "example-model", "X_VALIDATOR_FAST_API_KEY": "fixture-key"}
+                if provider == "qwen":
+                    env["X_VALIDATOR_FAST_BASE_URL"] = base_url
+                client = clients_from_env(env)["reader"]
+                self.assertEqual(client.grade(CLAIM, []), {"verdict": "insufficient"})
+                self.assertEqual(client.request_count, 1)
+                request = http.call_args.args[0]
+                body = json.loads(request.data)
+                self.assertEqual(request.full_url, base_url + "/chat/completions")
+                self.assertEqual(request.get_header("Authorization"), "Bearer fixture-key")
+                self.assertEqual(body[token_field], 2600)
+                if provider == "claude":
+                    schema = body["response_format"]["json_schema"]
+                    self.assertTrue(schema["strict"])
+                    self.assertEqual(set(schema["schema"]["required"]), {"verdict", "reason", "review_needed", "citations"})
+                else:
+                    self.assertEqual(body["response_format"], {"type": "json_object"})
+                if provider == "qwen":
+                    self.assertIs(body["enable_thinking"], False)
+                if provider == "doubao":
+                    self.assertEqual(body["thinking"], {"type": "disabled"})
+                with patch("deepseek_client.image_data_url", return_value="data:image/png;base64,fixture"):
+                    client.extract("fixture.png")
+                body = json.loads(http.call_args.args[0].data)
+                self.assertEqual(body["messages"][1]["content"][1]["image_url"]["url"], "data:image/png;base64,fixture")
+                if provider == "claude":
+                    schema = body["response_format"]["json_schema"]
+                    self.assertIn("claims", schema["schema"]["required"])
+
+    def test_kimi_only_config_reuses_key_and_uses_full_page_evidence(self):
+        env = {
+            "X_VALIDATOR_FAST_PROVIDER": "kimi", "X_VALIDATOR_FAST_MODEL": "kimi-k2.6", "X_VALIDATOR_FAST_API_KEY": "kimi-key",
+            "X_VALIDATOR_REVIEW_PROVIDER": "kimi", "X_VALIDATOR_REVIEW_MODEL": "kimi-k2.6", "X_VALIDATOR_WEB_PROVIDER": "kimi",
+        }
+        routes = clients_from_env(env)
+        self.assertEqual({routes[role].key for role in ("reader", "reviewer", "deepseek")}, {"kimi-key"})
+        web = routes["deepseek"]
+        with patch.object(web, "_request", side_effect=[
+            {"search_results": [{"url": SOURCE, "title": "History", "snippet": "Ignored " * 25, "text": ""}]},
+            {"title": "Mission records", "markdown": f"Mission archives and records. {QUOTE} The crew returned to Earth in July."},
+        ]) as request:
+            sources = fetch_sources(web, "Apollo 11 landing")
+        self.assertEqual(sources[0]["title"], "Mission records")
+        self.assertIn(QUOTE, sources[0]["content"])
+        self.assertEqual(request.call_args_list[0].args[0], "/tools/search")
+        self.assertTrue(request.call_args_list[0].args[1]["include_content"])
+        self.assertEqual(request.call_args_list[1].args, ("/tools/fetch", {"url": SOURCE}))
+
+        custom = clients_from_env(env | {"X_VALIDATOR_FAST_BASE_URL": "https://example.org/v1", "X_VALIDATOR_REVIEW_API_KEY": "review-key"})
+        self.assertEqual(custom["deepseek"].key, "review-key")
+        with self.assertRaisesRegex(ValueError, "X_VALIDATOR_REVIEW_API_KEY"):
+            clients_from_env(env | {"X_VALIDATOR_REVIEW_BASE_URL": "https://example.org/v1"})
+
+    def test_online_diagnostics_identify_permission_and_model_failures(self):
+        x = Mock()
+        x.search_posts.side_effect = [{}, HTTPError("https://example.org", 403, "forbidden", {}, None)]
+        reader = Mock()
+        reader.extract.return_value = {"visible_text": ""}
+        reviewer = Mock()
+        reviewer.grade.side_effect = DeepSeekError("模型余额不足。", 402)
+        web = Mock()
+        web.fetch.return_value = {"content": "Example Domain"}
+        clients = {"reader": reader, "reviewer": reviewer, "vision_reviewer": None, "deepseek": web}
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(check_online(x, clients, archive=True), 1)
+        self.assertIn("通过  X 最近搜索", output.getvalue())
+        self.assertIn("失败  X 全历史搜索", output.getvalue())
+        self.assertIn("图像输入和 JSON 输出能力", output.getvalue())
+        self.assertIn("模型余额不足", output.getvalue())
+        self.assertIn("通过  网页抓取", output.getvalue())
+        self.assertTrue(DEMO_IMAGE.is_file())
+        reader.extract.assert_called_once_with(DEMO_IMAGE, timeout=20)
+
     def test_matching_post_and_verified_evidence_are_separate(self):
-        result = verify({"image_path": "fixture.png", "text": POST["url"]}, LocalX(), LocalDeepSeek())
+        reviewer = Mock()
+        result = verify({"image_path": "fixture.png", "text": POST["url"]}, LocalX(), LocalDeepSeek(), reviewer=reviewer)
+        reviewer.grade.assert_not_called()
         self.assertEqual(result["original"]["status"], "matched")
         self.assertEqual(result["facts"][0]["verdict"], "supported")
         self.assertIn("【原帖核验】🟢", result["reply"])
@@ -89,6 +207,31 @@ class VerifyScreenshotTests(unittest.TestCase):
         self.assertIn("🟡 证据不足", result["facts_text"])
         self.assertIn("贴文证据支持度 暂无法评估", result["facts_text"])
         self.assertNotIn(SOURCE, result["reply"])
+
+    def test_complex_claim_uses_review_and_conflict_stays_unresolved(self):
+        primary = Mock(wraps=LocalDeepSeek())
+        primary.grade.return_value = LocalDeepSeek().grade(CLAIM, []) | {"review_needed": True}
+        reviewer = Mock()
+        reviewer.grade.return_value = LocalDeepSeek(verdict="refuted").grade(CLAIM, [])
+
+        result = verify({"image_path": "fixture.png"}, LocalX(), LocalDeepSeek(), reader=primary, reviewer=reviewer)
+
+        primary.grade.assert_called_once()
+        reviewer.grade.assert_called_once()
+        self.assertTrue(reviewer.grade.call_args.kwargs["review"])
+        self.assertEqual(result["facts"][0]["verdict"], "insufficient")
+        self.assertIn("相反结论", result["facts"][0]["reason"])
+
+    def test_retry_uses_the_separate_vision_model(self):
+        primary = Mock()
+        primary.extract.side_effect = DeepSeekError("First read failed")
+        visual_review = Mock(wraps=LocalDeepSeek())
+
+        result = verify({"image_path": "fixture.png"}, LocalX(), LocalDeepSeek(), reader=primary, vision_reviewer=visual_review)
+
+        primary.extract.assert_called_once_with("fixture.png")
+        visual_review.extract.assert_called_once_with("fixture.png")
+        self.assertEqual(result["original"]["status"], "matched")
 
     def test_fact_summary_distinguishes_pending_claims_from_refuted_claims(self):
         cases = (

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' file:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+  <title>X Validator 离线演示</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #edf2f2; color: #1f3137; font: 16px/1.6 system-ui, "Microsoft YaHei", sans-serif; }
+    main { max-width: 1080px; padding: 48px 28px 56px; margin: auto; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: clamp(30px, 5vw, 46px); line-height: 1.25; letter-spacing: -.035em; }
+    h2 { font-size: 20px; margin-bottom: 12px; }
+    h3 { font-size: 16px; }
+    header p { color: #455a60; margin: 12px 0 28px; }
+    .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; align-items: start; }
+    section { background: #fff; border: 1px solid #d4e0e0; padding: 22px; border-radius: 18px; }
+    img { width: 100%; height: auto; display: block; border: 1px solid #d8e1e1; border-radius: 12px; }
+    button { background: #08644e; color: #fff; border: 0; font: inherit; font-weight: 650; padding: 10px 18px; border-radius: 9px; margin-top: 17px; cursor: pointer; }
+    button:focus-visible, summary:focus-visible, h2:focus-visible { outline: 3px solid #2878b2; outline-offset: 4px; }
+    #placeholder { min-height: 136px; display: grid; place-items: center; color: #455a60; text-align: center; }
+    #placeholder[hidden] { display: none; }
+    .reply { display: grid; gap: 14px; margin-top: 16px; }
+    .reply article { padding: 12px 14px; border-radius: 10px; background: #f0f5f5; }
+    .reply p, .reply li { margin-top: 5px; }
+    .supported { color: #126447; }
+    .refuted { color: #9b302a; }
+    ol { margin: 8px 0 0; padding-left: 24px; }
+    details { margin-top: 15px; border-top: 1px solid #d8e1e1; padding-top: 12px; }
+    summary { cursor: pointer; }
+    details p { margin-top: 8px; color: #455a60; }
+    @media (max-width: 720px) { main { padding: 28px 16px; } .columns { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>X Validator 离线演示</h1>
+      <p>用虚构帖子和固定证据体验微信回复。无需登录微信、联网或填写 API Key。</p>
+    </header>
+    <div class="columns">
+      <section aria-labelledby="input-title">
+        <h2 id="input-title">要核验的截图</h2>
+        <img src="input.png" alt="虚构 Northbank Parks 帖子。公园周六上午 9 点开放，往返轮渡全天免费。">
+        <button type="button" id="run-demo" aria-controls="result" aria-expanded="false">用示例试一次</button>
+      </section>
+      <section aria-labelledby="result-title">
+        <h2 id="result-title" tabindex="-1">微信回复预览</h2>
+        <p id="placeholder">点击「用示例试一次」查看回复。</p>
+        <div id="result" hidden>
+          <img src="candidate.png" alt="固定的候选帖演示截图，显示与输入一致的作者、正文和日期。">
+          <div class="reply">
+            <article>
+              <h3 class="supported">【原帖核验】🟢 截图可见内容与原帖一致</h3>
+              <p>候选帖的账号、日期和正文与截图一致。</p>
+            </article>
+            <article>
+              <h3 class="supported">【账号可信度】🟩 账号与所填网站互相链接</h3>
+              <p>@NorthbankParks · 演示账号</p>
+              <p>依据来自账号所填网站的回链。帖内说法另看事实核验。</p>
+            </article>
+            <article>
+              <h3>【事实核验】贴文证据支持度 50%</h3>
+              <p>证据覆盖率 100%（2/2）｜支持 1 · 反驳 1 · 待核实 0</p>
+              <ol>
+                <li><strong class="supported">🟢 有证据支持</strong>｜公园周六上午 9 点开放。公园开放公告确认了时间。</li>
+                <li><strong class="refuted">🔴 有证据反驳</strong>｜当天往返轮渡全天免费。运营公告写明当天使用常规票价。</li>
+              </ol>
+              <details>
+                <summary>查看固定证据</summary>
+                <p>Northbank 公园开放公告示例：“Riverside Park opens at 9:00 AM this Saturday.”</p>
+                <p>Northbank 轮渡运营公告示例：“Regular ferry fares apply throughout Saturday.”</p>
+              </details>
+            </article>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+  <script>
+    document.querySelector('#run-demo').addEventListener('click', (event) => {
+      document.querySelector('#placeholder').hidden = true;
+      document.querySelector('#result').hidden = false;
+      event.currentTarget.setAttribute('aria-expanded', 'true');
+      document.querySelector('#result-title').focus();
+    });
+  </script>
+</body>
+</html>

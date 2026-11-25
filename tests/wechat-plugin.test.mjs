@@ -55,6 +55,30 @@ test("link replies and evidence questions use only the preceding result from tha
   assert.doesNotMatch((await handle({ content: "证据", messageId: "2" }, other)).text, /evidence/u);
 });
 
+test("local status records API attempts without copying a chat message", async () => {
+  const monitorDir = await mkdtemp(join(tmpdir(), "x-validator-status-"));
+  const file = join(monitorDir, "last-check.json");
+  try {
+    const handle = makeHandler({ monitorDir }, logger, async (settings, request) => {
+      if (request.text.endsWith("/43")) throw new Error("fixture timeout");
+      return { result: { reply: "private fixture reply", request_counts: { x: 2, model: 3, web: 1 } } };
+    });
+    await handle({ content: "https://x.com/example/status/42", messageId: "1" }, dm);
+    const successful = JSON.parse(await readFile(file, "utf8"));
+    assert.deepEqual(successful.counts, { x: 2, model: 3, web: 1 });
+    assert.equal(successful.ok, true);
+    assert.ok(successful.duration_ms >= 0);
+    assert.doesNotMatch(JSON.stringify(successful), /private fixture|example\/status|owner/u);
+    await handle({ content: "https://x.com/example/status/43", messageId: "2" }, dm);
+    const failed = JSON.parse(await readFile(file, "utf8"));
+    assert.equal(failed.ok, false);
+    assert.equal(failed.counts, null);
+  } finally {
+    await unlink(file);
+    await rmdir(monitorDir);
+  }
+});
+
 test("candidate screenshots precede the reply text and stay until delivery settles", async () => {
   const directory = await mkdtemp(join(tmpdir(), "x-validator-test-"));
   const worker = join(directory, "worker.py");

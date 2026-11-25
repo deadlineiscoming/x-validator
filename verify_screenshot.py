@@ -17,7 +17,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 
 from candidate_preview import capture_candidate
-from deepseek_client import DeepSeekClient, DeepSeekError
+from deepseek_client import DeepSeekError, clients_from_env
 from x_validator import HTTP_ERRORS, POST_HOSTS, USERNAME, XApiError, XClient, parse_post_id
 
 
@@ -111,6 +111,7 @@ def normalize_extraction(raw):
                     claims.append({"claim": claim, "query": query or claim})
     return {
         "is_x_post": raw["is_x_post"],
+        "ambiguous_target": raw.get("ambiguous_target") is True,
         "username": extracted_username(raw),
         "visible_text": visible,
         "date": date_hint if read_date(date_hint) else "",
@@ -152,27 +153,39 @@ def read_missing_header(client, path, raw, screenshot, received_at):
             screenshot[field] = header[field]
 
 
-def extract_screenshot(client, path, received_at, *, translation_hint=False, repair=True):
-    raw = client.extract(path)
-    screenshot = normalize_extraction(raw)
+def extract_screenshot(client, path, received_at, *, translation_hint=False, repair=True, vision_reviewer=None):
+    try:
+        raw = client.extract(path)
+        screenshot = normalize_extraction(raw)
+    except DeepSeekError:
+        if not vision_reviewer:
+            raise
+        raw = vision_reviewer.extract(path)
+        screenshot = normalize_extraction(raw)
+        repair = False
     if not screenshot["is_x_post"]:
         return screenshot
 
     screenshot["translated_only"] |= translation_hint
     if not repair:
         return screenshot
+    visual_review = vision_reviewer or client
     has_embedded_footer = raw.get("embedded_layout") is True and not (screenshot["translated_only"] or screenshot["relative_time"])
     has_complete_header = screenshot["username"] and screenshot["date"] and VISIBLE_CLOCK.fullmatch(screenshot["clock"])
-    if has_embedded_footer and not has_complete_header:
+    needs_embedded_review = has_embedded_footer and not has_complete_header
+    if needs_embedded_review or screenshot["ambiguous_target"]:
         try:
-            embedded = normalize_extraction(client.extract(path, focus_embed=True))
+            reviewed = normalize_extraction(visual_review.extract(path, focus_embed=has_embedded_footer))
         except (DeepSeekError, ValueError):
             return screenshot
-        if embedded["is_x_post"] and embedded["username"] and embedded["date"] and VISIBLE_CLOCK.fullmatch(embedded["clock"]):
-            embedded["translated_only"] |= translation_hint
-            return embedded
+        if (
+            reviewed["is_x_post"] and reviewed["username"] and not reviewed["ambiguous_target"]
+            and (not needs_embedded_review or (reviewed["date"] and VISIBLE_CLOCK.fullmatch(reviewed["clock"])))
+        ):
+            reviewed["translated_only"] |= translation_hint
+            return reviewed
     else:
-        read_missing_header(client, path, raw, screenshot, received_at)
+        read_missing_header(visual_review, path, raw, screenshot, received_at)
     return screenshot
 
 
@@ -621,20 +634,8 @@ def fetch_sources(client, query):
     return sources
 
 
-def check_claim(client, item):
-    result = {"claim": item["claim"], "verdict": "insufficient", "reason": "未取得可核对的独立证据。", "sources": []}
-    query = search_query(item["query"]) or search_query(item["claim"])
-    if not query:
-        return result
-    try:
-        sources = fetch_sources(client, query)
-        if not sources:
-            return result
-        grading = client.grade(item["claim"], [
-            {key: value for key, value in source.items() if key != "url"} for source in sources
-        ])
-    except DeepSeekError as exc:
-        return result | {"reason": str(exc)}
+def validate_grade(result, grading, sources):
+    result = result | {"sources": []}
     citations = grading.get("citations")
     if not isinstance(citations, list):
         citations = []
@@ -661,6 +662,47 @@ def check_claim(client, item):
     elif verdict in ("supported", "refuted"):
         result["reason"] = "未能在网页正文中核对结论对应的引用。"
     return result
+
+
+def check_claim(client, item, *, grader=None, reviewer=None, review_deadline=None):
+    claim = item["claim"]
+    base = {"claim": claim, "verdict": "insufficient", "reason": "未取得可核对的独立证据。", "sources": []}
+    if not client:
+        return base | {"reason": "尚未配置可用的网页取证 API。"}
+    query = search_query(item["query"]) or search_query(claim)
+    if not query:
+        return base
+    try:
+        sources = fetch_sources(client, query)
+    except DeepSeekError as exc:
+        return base | {"reason": str(exc)}
+    if not sources:
+        return base
+
+    evidence = [{key: value for key, value in source.items() if key != "url"} for source in sources]
+    try:
+        grading = (grader or client).grade(claim, evidence)
+        result = validate_grade(base, grading, sources)
+        needs_review = (
+            grading.get("review_needed") is True or grading.get("verdict") not in ("supported", "refuted", "insufficient")
+            or grading.get("verdict") == "refuted" or grading.get("verdict") != result["verdict"]
+        )
+    except DeepSeekError as exc:
+        result = base | {"reason": str(exc)}
+        needs_review = True
+    if not reviewer or not needs_review:
+        return result
+
+    timeout = min(12, review_deadline - monotonic()) if review_deadline is not None else 12
+    if timeout < 1:
+        return base | {"reason": "初判需要复核，本次处理时间不足。", "sources": result["sources"]}
+    try:
+        reviewed = validate_grade(base, reviewer.grade(claim, evidence, timeout=timeout, review=True), sources)
+    except DeepSeekError:
+        return base | {"reason": "初判需要复核，复核接口暂未完成。", "sources": result["sources"]}
+    if {result["verdict"], reviewed["verdict"]} == {"supported", "refuted"}:
+        return reviewed | {"verdict": "insufficient", "reason": "初判和复核对同一批证据得出相反结论，暂无法确认。"}
+    return reviewed
 
 
 def display_line(text):
@@ -751,8 +793,10 @@ def render(original, facts, fact_note, candidate, image):
     return root, "\n".join(facts_lines)
 
 
-def verify(payload, x_client, deepseek, allow_archive=True):
+def verify(payload, x_client, deepseek, allow_archive=True, *, reader=None, reviewer=None, vision_reviewer=None):
     started = monotonic()
+    if reader is None and hasattr(deepseek, "extract"):
+        reader = deepseek
     received_at = datetime.now(timezone.utc)
     text = clean_text(payload.get("text"), 4000)
     link = original_link(text)
@@ -763,13 +807,18 @@ def verify(payload, x_client, deepseek, allow_archive=True):
     fact_note = previous.get("fact_note", "") if isinstance(previous, dict) else ""
     if path:
         try:
-            if not deepseek:
-                raise DeepSeekError("本机尚未配置可用的 DeepSeek API Key。")
+            if not reader:
+                raise DeepSeekError("本机尚未配置可用的识图 AI API Key。")
             translation_hint = normalize(LINK.sub("", text)).strip("。！：") in TRANSLATION_CAPTIONS
-            screenshot = extract_screenshot(deepseek, path, received_at, translation_hint=translation_hint, repair=not link)
+            screenshot = extract_screenshot(
+                reader, path, received_at, translation_hint=translation_hint, repair=not link, vision_reviewer=vision_reviewer,
+            )
             if not screenshot["is_x_post"]:
                 screenshot = None
                 fact_note = "未识别为 X 帖子截图，请发送包含帖子正文的截图。"
+            elif screenshot["ambiguous_target"]:
+                screenshot = None
+                fact_note = "图中有多条可能的目标帖，请发一张只含目标帖的截图。"
         except (ValueError, DeepSeekError) as exc:
             fact_note = str(exc)
 
@@ -777,7 +826,10 @@ def verify(payload, x_client, deepseek, allow_archive=True):
         original_task = executor.submit(find_original, x_client, screenshot, link, allow_archive, received_at)
         tasks = []
         if path and screenshot:
-            tasks = [executor.submit(check_claim, deepseek, item) for item in screenshot["claims"]]
+            tasks = [
+                executor.submit(check_claim, deepseek, item, grader=reader, reviewer=reviewer, review_deadline=started + 92)
+                for item in screenshot["claims"]
+            ]
         original = original_task.result()
         account_task = executor.submit(assess_account, x_client, deepseek, screenshot, original, previous)
         candidate = original.get("candidate")
@@ -815,7 +867,11 @@ def main():
     parser.add_argument("--stdin", action="store_true", help="从标准输入接收 UTF-8 JSON")
     parser.add_argument("--image", help="本地截图路径")
     parser.add_argument("--link", default="", help="可选的公开 X 原帖链接")
+    parser.add_argument("--check-config", action="store_true", help="检查 AI 配置，无网络请求")
     args = parser.parse_args()
+    if args.check_config:
+        from diagnostics import check_ai_config
+        return check_ai_config(os.environ)
     try:
         payload = json.loads(sys.stdin.buffer.read(128 * 1024 + 1)) if args.stdin else {
             "image_path": args.image, "text": args.link,
@@ -823,8 +879,13 @@ def main():
         if not isinstance(payload, dict):
             raise ValueError("请输入核验对象。")
         x_client = client_or_none(XClient, os.environ.get("X_BEARER_TOKEN"))
-        deepseek = client_or_none(DeepSeekClient, os.environ.get("DEEPSEEK_API_KEY"))
-        result = verify(payload, x_client, deepseek, os.environ.get("X_VALIDATOR_ARCHIVE", "1") != "0")
+        clients = clients_from_env(os.environ)
+        result = verify(payload, x_client, allow_archive=os.environ.get("X_VALIDATOR_ARCHIVE", "1") != "0", **clients)
+        result["request_counts"] = {
+            "x": x_client.request_count if x_client else 0,
+            "model": sum(clients[role].request_count for role in ("reader", "reviewer", "vision_reviewer") if clients[role]),
+            "web": clients["deepseek"].request_count if clients["deepseek"] else 0,
+        }
         print(json.dumps(result, ensure_ascii=True))
     except (ValueError, OSError, TypeError, KeyError, AttributeError) as exc:
         # Internal details can contain user data. Only the exception class is logged.

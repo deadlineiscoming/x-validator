@@ -13,7 +13,8 @@ flowchart LR
     W[个人微信] -->|截图或原帖链接| O[ClawBot 和 OpenClaw]
     O -->|已下载的图片与消息信息| P[本机 Python 核验程序]
     P <-->|查公开原帖和账号资料| X[X 官方 API]
-    P <-->|识图与查证| D[DeepSeek API]
+    P <-->|识图与判定| M[可配置模型 API]
+    P <-->|网页搜索与抓取| W[DeepSeek 或 Kimi]
     P -->|格式化后的核验结果| O
     O -->|回复原会话| W
 ```
@@ -26,7 +27,9 @@ flowchart LR
 
 **账号可信度。** 优先评估截图显示的完整 `@账号`，只有链接时采用 X 返回的作者账号。复用查帖返回的同名作者资料，缺失时按用户名查询。展示 X 认证类型、戏仿标记、注册时间、关注者数量和自填简介。抓取主页所填网站核对是否回链，或搜索包含该账号链接的外部网页。结论反映可核对的身份和背景线索，历史发帖准确率需要另外取证。站外查询仅发送目标网址或公开用户名。 [X 账号查询](https://docs.x.com/x-api/users/get-user-by-username) · [X 认证与账号标记](https://help.x.com/en/rules-and-policies/profile-labels)
 
-**独立事实核验。** 后端用 DeepSeek Search 和 Fetch 查找证据、读取正文，优先查看当事机构原文、原始记录和有独立采证的报道。同一稿源的多篇转载按一份证据计算。模型只根据实际获取的材料评估截图中的说法，并返回所用证据的编号。程序从已获取的记录生成链接，检查结论是否引用了有效证据。原帖无法确认时，有可辨认的事实说法仍继续查证。 [DeepSeek 网页搜索与抓取](https://api-docs.deepseek.com/zh-cn/guides/search/)
+**独立事实核验。** 后端默认用 DeepSeek Search 和 Fetch 查找证据、读取正文，也可用 Kimi Web Search Basic 和 URL Fetch。优先查看当事机构原文、原始记录和有独立采证的报道。同一稿源的多篇转载按一份证据计算。模型只根据实际获取的材料评估截图中的说法，并返回所用证据的编号。程序检查引用片段能否在已获取的正文中找到。原帖无法确认时，有可辨认的事实说法仍继续查证。 [DeepSeek 网页工具](https://api-docs.deepseek.com/zh-cn/guides/search/) · [Kimi 网页工具](https://platform.kimi.ai/docs/api/tools-search)
+
+**模型分工。** 默认用 DeepSeek Flash 识图和初判，有可读材料且初判需要复核时，每条说法最多加一次 DeepSeek Pro 文字复核。程序校对两轮引用，证据结论互相冲突时保留证据不足。困难截图用视觉模型定向复读，默认是原图细节的 Flash。两条模型路线可分别配置厂商、Key、地址和模型。网页取证接口单独选择。程序按厂商的 Chat Completions 协议设置 JSON 输出与令牌限额。
 
 ## 微信里的结论
 
@@ -47,9 +50,9 @@ flowchart LR
 ## 运行和费用
 
 - **本机运行。** OpenClaw 和 Python 核验程序先放在同一台 Windows 电脑，使用本机进程交接。手机可以直接发图，电脑和网关需要保持在线。当前交互式 Python 已通过 Windows 系统代理接通 X，网关启动的实际进程也要验证网络路径。 [OpenClaw Windows 部署](https://docs.openclaw.ai/platforms/windows)
-- **需要配置的凭证。** X App-only Bearer Token 用于查原帖。首版拟使用同一个 `DEEPSEEK_API_KEY` 完成识图和独立网页查证。ClawBot 在手机微信扫码授权。凭证由本机运行环境按需注入，日志只留任务标识、耗时和错误类型。X API 返回的完整帖子在本机处理。DeepSeek 接收用户截图、提取出的待核验说法、检索词和独立证据片段。临时工作副本在处理后清理，网关的媒体缓存和会话保留策略在部署时核对。
+- **需要配置的凭证。** X App-only Bearer Token 用于查原帖。默认以同一个 `DEEPSEEK_API_KEY` 完成识图、初判、复核和网页取证，也可分别配置。ClawBot 在手机微信扫码授权。凭证由本机运行环境按需注入，日志只留任务标识、耗时和错误类型。识图服务接收截图，证据判定服务接收待核验说法和证据片段，网页取证服务接收检索词与待抓取 URL。X API 返回的帖子在本地比对。临时工作副本在处理后清理，网关的媒体缓存和会话保留策略在部署时核对。
 - **控制每次查询。** 每个请求最多发出两次 X 搜索，每次最多取 10 条候选。事实核验先查最多 3 条主要说法，每条最多读取 2 个候选来源。按会话和消息标识合并重复请求。遇到额度不足、限流或超时，在当次回复里给出已完成的部分和无法完成的原因。 [X API 计费](https://docs.x.com/x-api/getting-started/pricing) · [DeepSeek 搜索与抓取计费](https://api-docs.deepseek.com/zh-cn/guides/search/#计费)
-- **账号评估的增量。** 最多一次 X 账号读取和一次 DeepSeek Search 或 Fetch。补发链接时，复用同一 `@账号` 已取得的评估。X 按返回的账号资源计费，DeepSeek 按成功且有结果的查询计费。 [X API 计费](https://docs.x.com/x-api/getting-started/pricing) · [DeepSeek 搜索与抓取计费](https://api-docs.deepseek.com/zh-cn/guides/search/#计费)
+- **账号评估的增量。** 最多一次 X 账号读取和一次网页搜索或抓取。补发链接时，复用同一 `@账号` 已取得的评估。用量按所选服务计费。 [X API 计费](https://docs.x.com/x-api/getting-started/pricing) · [DeepSeek 搜索与抓取计费](https://api-docs.deepseek.com/zh-cn/guides/search/#计费)
 
 ## 实现顺序和验收
 

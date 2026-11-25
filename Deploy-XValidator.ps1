@@ -1,8 +1,18 @@
 [CmdletBinding()]
-param([switch] $PrepareOnly)
+param(
+    [switch] $PrepareOnly,
+    [ValidateSet('Start', 'Stop', 'Restart', 'Status', 'Configure', 'Doctor', 'Demo')]
+    [string] $Action = 'Start'
+)
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
+
+if ($Action -eq 'Demo') {
+    Start-Process -FilePath (Join-Path $PSScriptRoot 'docs\demo\index.html')
+    return
+}
+if ($PrepareOnly -and $Action -ne 'Start') { throw '-PrepareOnly is available with -Action Start.' }
 
 function Install-RequiredPackage([string] $Id) {
     $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
@@ -25,7 +35,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
         $pwsh = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
         if (-not $pwsh) { $pwsh = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
     }
-    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Action', $Action)
     if ($PrepareOnly) { $arguments += '-PrepareOnly' }
     & $pwsh @arguments
     exit $LASTEXITCODE
@@ -94,32 +104,107 @@ function Test-WeChatPairing {
     return $false
 }
 
+function Get-ValidatorGateway {
+    $listeners = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+    if (-not $listeners) { return }
+    $listener = $listeners[0]
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)"
+    $config = if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+        Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
+    }
+    if ($listeners.Count -ne 1 -or $listener.LocalAddress -ne '127.0.0.1' -or
+        $config.plugins.entries.'x-validator-wechat'.config.worker -ne $workerPath -or
+        $process.CommandLine -notmatch '\bgateway\s+run\b' -or
+        ([string]$process.CommandLine).IndexOf($openclaw, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        throw "Port $port is already in use by a listener this checkout cannot manage."
+    }
+    return $process
+}
+
+function Stop-ValidatorGateway($Gateway) {
+    if (-not $Gateway) {
+        Write-Host 'X Validator is stopped.'
+        return
+    }
+    try { $target = [Diagnostics.Process]::GetProcessById($Gateway.ProcessId) }
+    catch [ArgumentException] { return }
+    try {
+        if ($target.HasExited) { return }
+        if ([Math]::Abs(($target.StartTime - $Gateway.CreationDate).TotalSeconds) -gt 1) {
+            throw 'Gateway PID changed. Run Status to identify the current listener.'
+        }
+        $target.Kill($true)
+        if (-not $target.WaitForExit(15000)) { throw 'Gateway did not stop within 15 seconds.' }
+    } finally {
+        $target.Dispose()
+    }
+    $pidFile = Join-Path $root 'gateway.pid'
+    if (Test-Path -LiteralPath $pidFile -PathType Leaf) { Remove-Item -LiteralPath $pidFile }
+    Write-Host 'X Validator stopped.'
+}
+
+function Show-ValidatorStatus($Gateway) {
+    if ($Gateway) {
+        Write-Host "X Validator is running on 127.0.0.1:$port (PID $($Gateway.ProcessId))."
+        $routesPath = Join-Path $root 'active-routes.json'
+        $hasRoutes = $false
+        if (Test-Path -LiteralPath $routesPath -PathType Leaf) {
+            $routes = Get-Content -LiteralPath $routesPath -Raw | ConvertFrom-Json -AsHashtable
+            if ($routes.pid -eq $Gateway.ProcessId) {
+                foreach ($route in $routes.routes.GetEnumerator()) { Write-Host "  $($route.Key)  $($route.Value)" }
+                $hasRoutes = $true
+            }
+        }
+        if (-not $hasRoutes) { Write-Host 'Active API routes will appear after the next start.' }
+    } else {
+        Write-Host 'X Validator is stopped.'
+        $paired = if (Test-WeChatPairing) { 'saved' } else { 'not set up' }
+        Write-Host "WeChat pairing $paired."
+    }
+    $lastPath = Join-Path $root 'last-check.json'
+    if (Test-Path -LiteralPath $lastPath -PathType Leaf) {
+        $last = Get-Content -LiteralPath $lastPath -Raw | ConvertFrom-Json
+        $outcome = if ($last.ok) { 'completed' } else { 'worker failed' }
+        $timestamp = ([datetimeoffset]$last.finished_at).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss zzz')
+        Write-Host "Last verification $timestamp  $outcome  $($last.duration_ms) ms"
+        if ($last.counts) {
+            Write-Host "  API requests  X $($last.counts.x)  Models $($last.counts.model)  Web evidence $($last.counts.web)"
+        } else { Write-Host '  API request counts unavailable.' }
+    } else { Write-Host 'No verification statistics recorded yet.' }
+    if ($Gateway) {
+        $env:Path = "$(Split-Path -Parent $Gateway.ExecutablePath);$env:Path"
+        Invoke-Launcher 'Status'
+    }
+}
+
 $mutex = [System.Threading.Mutex]::new($false, 'Local\XValidator-Deploy-18647')
 $locked = $false
 try {
     try { $locked = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $locked = $true }
     if (-not $locked) { throw 'An X Validator deployment is already running.' }
 
-    $config = if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-        Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
-    }
-    $configuredWorker = $config.plugins.entries.'x-validator-wechat'.config.worker
-    $listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($listener) {
-        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)"
-        if ($configuredWorker -ne $workerPath -or $process.CommandLine -notlike '*gateway run*' -or
-            ([string]$process.CommandLine).IndexOf($openclaw, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-            throw "Port $port is already in use. Stop the other gateway or listener before deploying from this checkout."
-        }
+    if ($Action -in @('Start', 'Stop', 'Restart', 'Status')) { $running = Get-ValidatorGateway }
+    if ($Action -eq 'Stop') { Stop-ValidatorGateway $running; return }
+    if ($Action -eq 'Status') { Show-ValidatorStatus $running; return }
+    if ($running -and $Action -eq 'Start') {
         Write-Host 'This checkout is configured and its gateway is running.'
         return
     }
 
+    $config = if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+        Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
+    }
+    $configuredWorker = $config.plugins.entries.'x-validator-wechat'.config.worker
     $python = Find-Python
     if (-not $python) {
         Install-RequiredPackage 'Python.Python.3.13'
         $python = Find-Python
         if (-not $python) { throw 'Python 3.10 or later was not found after installation.' }
+    }
+    $env:Path = "$(Split-Path -Parent $python);$env:Path"
+    if ($Action -in @('Configure', 'Doctor')) {
+        Invoke-Launcher $Action
+        return
     }
     $node = Find-Node
     if (-not $node) {
@@ -127,7 +212,7 @@ try {
         $node = Find-Node
         if (-not $node) { throw 'OpenClaw needs Node.js 24.16-24.x or 26.1 and later.' }
     }
-    $env:Path = "$(Split-Path -Parent $python);$(Split-Path -Parent $node);$env:Path"
+    $env:Path = "$(Split-Path -Parent $node);$env:Path"
     if (-not (Test-Browser)) {
         Install-RequiredPackage 'Microsoft.Edge'
         if (-not (Test-Browser)) { throw 'Microsoft Edge or Google Chrome is required.' }
@@ -144,16 +229,11 @@ try {
         return
     }
 
-    $credentialPath = Join-Path $root 'credentials.xml'
-    if (-not (Test-Path -LiteralPath $credentialPath -PathType Leaf)) {
-        Invoke-Launcher 'Credentials'
+    & $entryScript -Action CheckSetup
+    if ($LASTEXITCODE -ne 0) {
+        Invoke-Launcher 'Configure'
     }
-    $stored = Import-Clixml -LiteralPath $credentialPath
-    foreach ($name in 'X_BEARER_TOKEN', 'DEEPSEEK_API_KEY') {
-        if ($stored[$name] -isnot [securestring] -or $stored[$name].Length -eq 0) {
-            throw 'Re-enter the local API credentials with Start-XValidator.ps1 -Action Credentials.'
-        }
-    }
+    if ($running) { Stop-ValidatorGateway $running }
     if (-not (Test-WeChatPairing)) {
         Invoke-Launcher 'Pair'
         if (-not (Test-WeChatPairing)) { throw 'WeChat pairing did not finish. Run deployment again to retry.' }

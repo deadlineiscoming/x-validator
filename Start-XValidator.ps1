@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Setup', 'Pair', 'Run', 'Status', 'Credentials')]
-    [string] $Action = 'Run'
+    [ValidateSet('Setup', 'Pair', 'Run', 'Status', 'Credentials', 'ModelCredentials', 'CheckAI', 'CheckSetup', 'Doctor', 'Configure')]
+    [string] $Action = 'Run',
+    [ValidateSet('All', 'Fast', 'Review', 'Web')]
+    [string] $Slot = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,21 +16,53 @@ $gatewayPort = 18647
 $modules = Join-Path $runtime 'node_modules'
 $openclaw = Join-Path $modules 'openclaw\openclaw.mjs'
 $weixin = Join-Path $modules '@tencent-weixin\openclaw-weixin'
+$credentialPath = Join-Path $root 'credentials.xml'
+. (Join-Path $PSScriptRoot 'scripts\Configuration.ps1')
 
 $env:OPENCLAW_STATE_DIR = $state
 $env:OPENCLAW_CONFIG_PATH = $configPath
 
-if ($Action -eq 'Credentials') {
-    $xToken = Read-Host 'X App-only Bearer Token' -AsSecureString
-    $deepSeekKey = Read-Host 'DeepSeek API Key' -AsSecureString
-    if ($xToken.Length -eq 0 -or $deepSeekKey.Length -eq 0) {
-        throw 'Both credentials are required.'
+if ($Action -in @('Credentials', 'ModelCredentials')) {
+    $stored = Read-XValidatorSettings
+    if ($Action -eq 'Credentials') {
+        $xToken = Read-Host 'X App-only Bearer Token' -AsSecureString
+        if ($xToken.Length -eq 0) { throw 'An X App-only Bearer Token is required.' }
+        $deepSeekKey = Read-Host 'Shared DeepSeek API Key (leave blank to keep the current key or use other providers)' -AsSecureString
+        $stored['X_BEARER_TOKEN'] = $xToken
+        if ($deepSeekKey.Length -gt 0) { $stored['DEEPSEEK_API_KEY'] = $deepSeekKey }
+    } else {
+        $selectedKeys = if ($Slot -eq 'All') { $modelKeys } else { "X_VALIDATOR_$($Slot.ToUpperInvariant())_API_KEY" }
+        foreach ($name in $selectedKeys) {
+            $key = Read-Host "$name (empty clears this override)" -AsSecureString
+            if ($key.Length -gt 0) { $stored[$name] = $key }
+            else { $stored.Remove($name) }
+            $stored.Remove($name + '_ROUTE')
+        }
     }
-    New-Item -ItemType Directory -Path $root -Force | Out-Null
-    @{ X_BEARER_TOKEN = $xToken; DEEPSEEK_API_KEY = $deepSeekKey } |
-        Export-Clixml -LiteralPath (Join-Path $root 'credentials.xml')
+    Save-XValidatorSettings $stored
     Write-Host 'Credentials encrypted for the current Windows user.'
     exit 0
+}
+
+if ($Action -in @('CheckAI', 'CheckSetup', 'Doctor', 'Configure', 'Run')) {
+    $python = (Get-Command python.exe -ErrorAction Stop).Source
+    $diagnostics = Join-Path $PSScriptRoot 'diagnostics.py'
+}
+
+if ($Action -eq 'Configure') {
+    Invoke-XValidatorWizard $python $diagnostics
+    exit 0
+}
+
+if ($Action -in @('CheckAI', 'CheckSetup', 'Doctor')) {
+    With-XValidatorSettings (Read-XValidatorSettings) {
+        switch ($Action) {
+            'CheckAI' { & $python (Join-Path $PSScriptRoot 'verify_screenshot.py') --check-config }
+            'CheckSetup' { & $python $diagnostics }
+            'Doctor' { & $python $diagnostics --online }
+        }
+    }
+    exit $LASTEXITCODE
 }
 
 if ($Action -eq 'Setup') {
@@ -93,17 +127,12 @@ switch ($Action) {
         & node.exe $openclaw channels status --probe
     }
     'Run' {
-        $credentialPath = Join-Path $root 'credentials.xml'
-        if (Test-Path -LiteralPath $credentialPath) {
-            $stored = Import-Clixml -LiteralPath $credentialPath
-            foreach ($name in @('X_BEARER_TOKEN', 'DEEPSEEK_API_KEY')) {
-                if (-not [Environment]::GetEnvironmentVariable($name) -and $stored[$name]) {
-                    $value = [System.Net.NetworkCredential]::new('', $stored[$name]).Password
-                    [Environment]::SetEnvironmentVariable($name, $value, 'Process')
-                }
-            }
+        With-XValidatorSettings (Read-XValidatorSettings) {
+            $env:X_VALIDATOR_MONITOR_DIR = $root
+            $env:X_VALIDATOR_ACTIVE_ROUTES = & $python $diagnostics --snapshot
+            if ($LASTEXITCODE -ne 0) { throw '请检查 AI 配置后再运行。' }
+            & node.exe $openclaw gateway run --bind loopback --port $gatewayPort
         }
-        & node.exe $openclaw gateway run --bind loopback --port $gatewayPort
     }
 }
 exit $LASTEXITCODE

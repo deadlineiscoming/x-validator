@@ -11,8 +11,14 @@ openclaw/
 .env.*
 credentials/
 credentials.xml
+credentials.xml.*.tmp
 media/
 openclaw.json*
+openclaw-weixin/
+active-routes.json
+active-routes.json.*.tmp
+last-check.json
+last-check.json.*.tmp
 *.log
 *.pid
 *.sqlite*
