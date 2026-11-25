@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-tests:
+    name: Windows tests
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Python unit tests
+        run: python -B -m unittest discover -s tests
+      - name: WeChat plugin tests
+        run: node --test tests/wechat-plugin.test.mjs
+      - name: PowerShell syntax
+        shell: pwsh
+        run: |
+          $parseFailed = $false
+          foreach ($scriptPath in (git -c core.quotepath=false ls-files -- '*.ps1')) {
+            $tokens = $null
+            $errors = $null
+            $fullPath = (Resolve-Path -LiteralPath $scriptPath).Path
+            $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              $fullPath, [ref]$tokens, [ref]$errors
+            )
+            foreach ($errorItem in $errors) {
+              Write-Host "${scriptPath}: $($errorItem.Message)"
+              $parseFailed = $true
+            }
+          }
+          if ($parseFailed) { exit 1 }
