@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 私密报告安全漏洞
+    url: https://github.com/deadlineiscoming/x-validator/security/advisories/new
+    about: 通过 GitHub 私下向维护者报告安全问题。

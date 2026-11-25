@@ -86,7 +86,7 @@ test("candidate screenshots precede the reply text and stay until delivery settl
     await writeFile(worker, `
 import json, sys
 from pathlib import Path
-folder = Path(json.load(sys.stdin)["preview_dir"])
+folder = Path(json.load(sys.stdin.buffer)["preview_dir"])
 names = ["candidate-1.png", "candidate-2.png"]
 for name in names:
     (folder / name).write_bytes(b"fixture")

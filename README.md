@@ -4,6 +4,8 @@
 
 架构、比对规则和验收范围见 [X Validator 微信截图核验设计](docs/design.md)。
 
+欢迎反馈问题或提交 PR，参与方式见 [贡献指南](CONTRIBUTING.md)。
+
 ## 使用许可
 
 本项目采用**源码可见、限非商业用途**的许可方式。按许可证条款，你可以为非商业目的使用、修改和分发本仓库代码。商业用途需另行取得权利人授权。具体允许的用途以许可证全文为准。 [PolyForm Noncommercial License 1.0.0](LICENSE)
